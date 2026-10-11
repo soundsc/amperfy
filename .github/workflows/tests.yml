@@ -1,0 +1,111 @@
+# Fork-only CI: builds Amperfy and runs AmperfyKitTests on a macOS runner.
+# Lives on the ci/macos-tests branch and is not part of any upstream pull request.
+name: AmperfyKitTests
+
+on:
+  push:
+    branches: [ci/macos-tests]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test (${{ matrix.ref }})
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        ref:
+          - master
+          - fix/songs-without-album-hidden
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          echo "::notice title=Toolchain (${{ matrix.ref }})::$(xcodebuild -version | tr '\n' ' ')"
+
+      - name: Pick an iPhone simulator
+        run: |
+          xcrun simctl list devices available -j > devices.json
+          UDID=$(python3 - <<'PY'
+          import json, re
+          best = None
+          for runtime, devices in json.load(open("devices.json"))["devices"].items():
+              m = re.search(r"iOS-(\d+)-(\d+)", runtime)
+              if not m:
+                  continue
+              version = (int(m.group(1)), int(m.group(2)))
+              for d in devices:
+                  if d["name"].startswith("iPhone") and (best is None or version > best[0]):
+                      best = (version, d["udid"], d["name"])
+          if best:
+              print(best[1])
+          PY
+          )
+          rm devices.json
+          if [ -z "$UDID" ]; then
+            echo "::error title=Simulator::No iPhone simulator available"
+            xcrun simctl list devices available
+            exit 1
+          fi
+          xcrun simctl list devices available | grep "$UDID"
+          echo "SIM_UDID=$UDID" >> "$GITHUB_ENV"
+
+      - name: Build and run AmperfyKitTests
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project Amperfy.xcodeproj \
+            -scheme Amperfy \
+            -destination "id=$SIM_UDID" \
+            -only-testing:AmperfyKitTests \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" \
+            | grep -E "error:|warning: unre|Test Suite|Test Case .* (failed|passed)|Executed [0-9]+ tests|\*\* (TEST|BUILD)" || true
+          grep -q "\*\* TEST SUCCEEDED \*\*" "$RUNNER_TEMP/xcodebuild.log"
+
+      # Annotations are readable without logging in, unlike the raw logs.
+      - name: Summarise result
+        if: always()
+        run: |
+          LOG="$RUNNER_TEMP/xcodebuild.log"
+          [ -f "$LOG" ] || { echo "::error title=Result (${{ matrix.ref }})::xcodebuild did not run"; exit 0; }
+          RESULT=$(grep -E "\*\* (TEST|BUILD) [A-Z]+ \*\*" "$LOG" | tail -1)
+          EXECUTED=$(grep -E "Executed [0-9]+ tests" "$LOG" | tail -1 | sed 's/^[[:space:]]*//')
+          NEW=$(grep -E "Test Case .*testAvailabilityWith(out)?Album\]' (passed|failed)" "$LOG" | sed -E "s/.*(testAvailability[A-Za-z]+)\]' ([a-z]+).*/\1=\2/" | sort -u | tr '\n' ' ')
+          echo "::notice title=Result (${{ matrix.ref }})::${RESULT:-no result line} | ${EXECUTED:-no tests executed} | new tests: ${NEW:-not present}"
+          grep -E "Test Case .* failed" "$LOG" | sort -u | head -8 | while read -r line; do
+            echo "::error title=Failed test (${{ matrix.ref }})::$line"
+          done
+          grep -E "error:" "$LOG" | sort -u | head -8 | while read -r line; do
+            echo "::error title=Error (${{ matrix.ref }})::$line"
+          done
+
+      - name: Report SwiftFormat changes
+        if: always()
+        run: |
+          git diff --stat
+          git diff > "$RUNNER_TEMP/swiftformat.patch"
+          if [ -s "$RUNNER_TEMP/swiftformat.patch" ]; then
+            FILES=$(git diff --name-only | tr '\n' ' ')
+            echo "::warning title=SwiftFormat (${{ matrix.ref }})::Build changed files: $FILES"
+            git diff
+          else
+            echo "::notice title=SwiftFormat (${{ matrix.ref }})::No formatting changes"
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            ${{ runner.temp }}/swiftformat.patch
+          if-no-files-found: ignore
