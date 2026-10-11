@@ -9,25 +9,41 @@ on:
 
 jobs:
   test:
-    name: test (${{ matrix.ref }})
+    name: ${{ matrix.label }}
     runs-on: macos-26
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        ref:
-          - master
-          - fix/songs-without-album-hidden
+        include:
+          - label: master
+            ref: master
+            expect: pass
+          - label: fix
+            ref: fix/songs-without-album-hidden
+            expect: pass
+          # New tests on unpatched app code: shows that the tests detect the bug.
+          - label: tests-without-fix
+            ref: fix/songs-without-album-hidden
+            revert_app_code: true
+            expect: fail
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ matrix.ref }}
+          fetch-depth: 0
+
+      - name: Revert app code to master (keep the new tests)
+        if: matrix.revert_app_code
+        run: |
+          git checkout origin/master -- AmperfyKit Amperfy
+          git status --short
 
       - name: Show toolchain
         run: |
           xcodebuild -version
           swift --version
-          echo "::notice title=Toolchain (${{ matrix.ref }})::$(xcodebuild -version | tr '\n' ' ')"
+          echo "::notice title=Toolchain (${{ matrix.label }})::$(xcodebuild -version | tr '\n' ' ')"
 
       - name: Pick an iPhone simulator
         run: |
@@ -68,43 +84,47 @@ jobs:
             -skipMacroValidation \
             2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" \
             | grep -E "error:|warning: unre|Test Suite|Test Case .* (failed|passed)|Executed [0-9]+ tests|\*\* (TEST|BUILD)" || true
-          grep -q "\*\* TEST SUCCEEDED \*\*" "$RUNNER_TEMP/xcodebuild.log"
+          if [ "${{ matrix.expect }}" = "fail" ]; then
+            grep -q "\*\* TEST FAILED \*\*" "$RUNNER_TEMP/xcodebuild.log"
+          else
+            grep -q "\*\* TEST SUCCEEDED \*\*" "$RUNNER_TEMP/xcodebuild.log"
+          fi
 
       # Annotations are readable without logging in, unlike the raw logs.
       - name: Summarise result
         if: always()
         run: |
           LOG="$RUNNER_TEMP/xcodebuild.log"
-          [ -f "$LOG" ] || { echo "::error title=Result (${{ matrix.ref }})::xcodebuild did not run"; exit 0; }
+          [ -f "$LOG" ] || { echo "::error title=Result (${{ matrix.label }})::xcodebuild did not run"; exit 0; }
           RESULT=$(grep -E "\*\* (TEST|BUILD) [A-Z]+ \*\*" "$LOG" | tail -1)
           EXECUTED=$(grep -E "Executed [0-9]+ tests" "$LOG" | tail -1 | sed 's/^[[:space:]]*//')
-          NEW=$(grep -E "Test Case .*testAvailabilityWith(out)?Album\]' (passed|failed)" "$LOG" | sed -E "s/.*(testAvailability[A-Za-z]+)\]' ([a-z]+).*/\1=\2/" | sort -u | tr '\n' ' ')
-          echo "::notice title=Result (${{ matrix.ref }})::${RESULT:-no result line} | ${EXECUTED:-no tests executed} | new tests: ${NEW:-not present}"
+          NEW=$(grep -E "Test Case .*(testAvailabilityWith(out)?Album|testSongWithoutAlbumIsDisplayed)\]' (passed|failed)" "$LOG" | sed -E "s/.* ([A-Za-z]+)\]' ([a-z]+).*/\1=\2/" | sort -u | tr '\n' ' ')
+          echo "::notice title=Result (${{ matrix.label }})::${RESULT:-no result line} | ${EXECUTED:-no tests executed} | new tests: ${NEW:-not present}"
           grep -E "Test Case .* failed" "$LOG" | sort -u | head -8 | while read -r line; do
-            echo "::error title=Failed test (${{ matrix.ref }})::$line"
+            echo "::warning title=Failed test (${{ matrix.label }})::$line"
           done
-          grep -E "error:" "$LOG" | sort -u | head -8 | while read -r line; do
-            echo "::error title=Error (${{ matrix.ref }})::$line"
+          grep -E "^/.*: error:" "$LOG" | sort -u | head -8 | while read -r line; do
+            echo "::error title=Error (${{ matrix.label }})::$line"
           done
 
       - name: Report SwiftFormat changes
-        if: always()
+        if: always() && !matrix.revert_app_code
         run: |
           git diff --stat
           git diff > "$RUNNER_TEMP/swiftformat.patch"
           if [ -s "$RUNNER_TEMP/swiftformat.patch" ]; then
             FILES=$(git diff --name-only | tr '\n' ' ')
-            echo "::warning title=SwiftFormat (${{ matrix.ref }})::Build changed files: $FILES"
+            echo "::warning title=SwiftFormat (${{ matrix.label }})::Build changed files: $FILES"
             git diff
           else
-            echo "::notice title=SwiftFormat (${{ matrix.ref }})::No formatting changes"
+            echo "::notice title=SwiftFormat (${{ matrix.label }})::No formatting changes"
           fi
 
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ strategy.job-index }}
+          name: logs-${{ matrix.label }}
           path: |
             ${{ runner.temp }}/xcodebuild.log
             ${{ runner.temp }}/swiftformat.patch
