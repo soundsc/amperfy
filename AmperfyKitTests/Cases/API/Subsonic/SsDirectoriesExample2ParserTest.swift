@@ -64,6 +64,72 @@ class SsDirectoriesExample2ParserTest: AbstractSsParserTest {
     XCTAssertFalse((ssParserDelegate as! SsPlayableParserDelegate).isCollectionCached)
   }
 
+  func testSongWithoutAlbumIsDisplayed() {
+    testParsing()
+    library.saveContext()
+
+    // song "112" has no albumId in the response
+    guard let songWithoutAlbum = directory.songs.first(where: { $0.id == "112" })
+    else { XCTFail(); return }
+    XCTAssertNil(songWithoutAlbum.album)
+    XCTAssertTrue(songWithoutAlbum.isAvailableToUser())
+
+    // same predicates as DirectorySongsFetchedResultsController
+    let fetchRequest = SongMO.trackNumberSortedFetchRequest
+    fetchRequest.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+      SongMO.excludeServerDeleteUncachedSongsFetchPredicate,
+      library.getSongFetchPredicate(forDirectory: directory),
+    ])
+    let foundSongs = try? context.fetch(fetchRequest)
+    let songs = foundSongs?.compactMap { Song(managedObject: $0) }
+    guard let songs = songs else { XCTFail(); return }
+    XCTAssertEqual(songs.map { $0.id }.sorted(), ["111", "112"])
+  }
+
+  func testRemovedSongsWithoutAlbumAreMarkedRemoteDeleted() {
+    let album = library.createAlbum(account: account)
+    album.id = "9000"
+
+    // no longer in the directory and nowhere else -> deleted on the server
+    let removedSong = library.createSong(account: account)
+    removedSong.id = "901"
+    directory.managedObject.addToSongs(removedSong.managedObject)
+
+    // no longer in the directory, but still in a music folder -> moved, not deleted
+    let movedSong = library.createSong(account: account)
+    movedSong.id = "902"
+    directory.managedObject.addToSongs(movedSong.managedObject)
+    library.createMusicFolder(account: account).managedObject.addToSongs(movedSong.managedObject)
+
+    // no longer in the directory, but has an album -> left to the album sync
+    let songWithAlbum = library.createSong(account: account)
+    songWithAlbum.id = "903"
+    songWithAlbum.album = album
+    directory.managedObject.addToSongs(songWithAlbum.managedObject)
+    library.saveContext()
+
+    // parse without checkCorrectParsing(): the extra entities change the library counts
+    guard let data = xmlData else { XCTFail(); return }
+    let idParser = XMLParser(data: data)
+    idParser.delegate = ssIdParserDelegate
+    idParser.parse()
+    createParserDelegate()
+    let parser = XMLParser(data: data)
+    parser.delegate = ssParserDelegate
+    parser.parse()
+    XCTAssertNil(ssParserDelegate?.error)
+    library.saveContext()
+
+    XCTAssertEqual(directory.songs.map { $0.id }.sorted(), ["111", "112"])
+    XCTAssertNil(removedSong.managedObject.directory)
+    XCTAssertEqual(removedSong.remoteStatus, .deleted)
+    XCTAssertEqual(movedSong.remoteStatus, .available)
+    XCTAssertEqual(songWithAlbum.remoteStatus, .available)
+    for song in directory.songs {
+      XCTAssertEqual(song.remoteStatus, .available)
+    }
+  }
+
   override func checkCorrectParsing() {
     prefetchIdTester.checkPrefetchIdCounts(
       artworkCount: 2,
